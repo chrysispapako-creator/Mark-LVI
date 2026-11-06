@@ -369,6 +369,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-data", action="store_true",
                         help="With --rollback, also restore the pre-update snapshot of keys and memory.")
     parser.add_argument("--backup-root", default="", help="Where to create the backup. Defaults to a sibling Mark-LVI-backups folder.")
+    parser.add_argument(
+        "--manifest", default="",
+        help="File list to copy. Defaults to scripts/memory_update_files.txt. "
+             "A smaller list (scripts/fancy_dashboard_update_files.txt) adds "
+             "only the dashboard tool on a machine that already has the memory update.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -382,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.install),
                 yes=args.yes,
                 dry_run=args.dry_run,
+                manifest_path=Path(args.manifest) if args.manifest else None,
                 backup_root=Path(args.backup_root) if args.backup_root else None,
             )
     except UpdateError as exc:

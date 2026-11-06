@@ -1,0 +1,10 @@
+# Files for the Fancy Dashboard tool only.
+# Use this list when the memory journal (MEMORY_VERSION 1) is already installed.
+# Do not add API keys, long_term.json, the journal, .venv, voice_bridge.py,
+# plugins/grok_voice_bridge.py, or the dashboard's own launcher.
+
+plugins/fancy_dashboard.py
+plugins/_fancy_dashboard_test.py
+scripts/FANCY_DASHBOARD_UPDATE.md
+scripts/fancy_dashboard_update_files.txt
+scripts/windows_fancy_dashboard_update.ps1
