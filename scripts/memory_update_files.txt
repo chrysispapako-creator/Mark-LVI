@@ -1,0 +1,25 @@
+# Files the memory update is allowed to copy onto an existing install.
+# Protected paths (API keys, long_term.json, the journal, voice_bridge.py,
+# plugins/grok_voice_bridge.py, .venv) must never be added here.
+# The updater rejects the whole run if one of them appears.
+
+.gitignore
+AGENTS.md
+main.py
+ui.py
+core/prompt.txt
+providers/schema.py
+actions/background_monitor.py
+actions/proactive.py
+memory/MEMORY.md
+memory/_tests.py
+memory/memory_manager.py
+memory/redact.py
+memory/session.py
+memory/store.py
+memory/update_apply.py
+scripts/WINDOWS_UPDATE.md
+scripts/apply_memory_update.py
+scripts/memory_update_files.txt
+scripts/windows_memory_rollback.ps1
+scripts/windows_memory_update.ps1
