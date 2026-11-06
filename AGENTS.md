@@ -90,6 +90,17 @@ a small built-in fallback — instead of crashing.
   `_show_content` is the pattern to copy.
 - Colours come from the `C` palette class; fonts are `QFont("Courier New", size)`.
 
+## Memory
+
+Facts (name, preferences, projects) go through `memory/memory_manager.py`
+and stay in `memory/long_term.json`. Conversations, tasks, decisions,
+actions and results go through `memory/store.py` and stay in
+`memory/journal.sqlite`. Both are one shared memory: search them with
+`search_memory` / the `recall_memory` tool. Do not open either file from a
+plugin, and do not send the journal to a model to summarise it — compaction
+is local and has to work with no API key. Limits and the secret filter are
+in `memory/MEMORY.md`. The filter is not a guarantee.
+
 ## General
 
 - Never send a child process's output to `DEVNULL` without logging it, and

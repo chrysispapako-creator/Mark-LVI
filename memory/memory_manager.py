@@ -1,9 +1,12 @@
 import json
+import os
 import re
 from datetime import datetime
-from threading import Lock
+from threading import RLock
 from pathlib import Path
 import sys
+
+from memory.redact import redact_text
 
 
 def get_base_dir() -> Path:
@@ -14,7 +17,11 @@ def get_base_dir() -> Path:
 
 BASE_DIR         = get_base_dir()
 MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
-_lock            = Lock()
+# RLock: a read-modify-write holds it, and a notifier or a nested load from
+# the same thread must not deadlock. Threads that only share the lock
+# (the voice loop, a tool worker, the monitor) queue instead of interleaving
+# two updates and dropping one of them — that was the old load-then-save race.
+_lock            = RLock()
 MAX_VALUE_LENGTH = 380
 
 # ── Why there are two very different numbers here ────────────────────────────
@@ -54,22 +61,94 @@ def _empty_memory() -> dict:
         "notes":         {},
     }
 
-def load_memory() -> dict:
+class MemoryReadError(Exception):
+    """The fact file exists and could not be parsed. Writers must not replace it."""
+
+
+def _normalize(data: dict) -> dict:
+    # Fill categories the rest of the app assumes are dicts. Leave every other
+    # key alone — `sessions` is a list and `monitors` is its own dict, and
+    # both are user data this function must not reshape.
+    base = _empty_memory()
+    for key in base:
+        if key not in data:
+            data[key] = {}
+    return data
+
+
+def _load_unlocked() -> dict:
+    """Caller holds ``_lock``. Raises MemoryReadError instead of returning empty
+    when the file is present but unreadable — an empty dict written back would
+    erase the user's facts."""
     if not MEMORY_PATH.exists():
         return _empty_memory()
+    try:
+        data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[Memory] ⚠️ Load error: {exc}")
+        raise MemoryReadError(str(exc)) from exc
+    if not isinstance(data, dict):
+        raise MemoryReadError("memory file is not a JSON object")
+    return _normalize(data)
+
+
+def load_memory() -> dict:
+    """Facts for the prompt and the panel. A corrupt file reads as empty and
+    is left on disk untouched.
+
+    The first successful load scrubs secret-shaped fact values onto disk.
+    Later loads in this process do not rewrite the file again.
+    """
+    global _facts_scrubbed
     with _lock:
         try:
-            data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                base = _empty_memory()
-                for key in base:
-                    if key not in data:
-                        data[key] = {}
-                return data
+            data = _load_unlocked()
+        except MemoryReadError:
             return _empty_memory()
-        except Exception as e:
-            print(f"[Memory] ⚠️ Load error: {e}")
-            return _empty_memory()
+        if not _facts_scrubbed:
+            removed = _redact_inplace(data)
+            _facts_scrubbed = True
+            if removed:
+                _save_unlocked(data)
+                print(f"[Memory] Redacted {removed} secret-shaped span(s) in {MEMORY_PATH.name}")
+        return data
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def update_raw(mutator) -> bool:
+    """Locked read-modify-write of the whole fact file.
+
+    ``mutator`` receives the dict and edits it in place. Returns False when
+    the file could not be read, in which case nothing is written. Returns
+    True after a successful replace. The journal is a different file; this
+    only covers ``long_term.json``.
+    """
+    with _lock:
+        try:
+            memory = _load_unlocked()
+        except MemoryReadError as exc:
+            print(f"[Memory] refusing to write over unreadable {MEMORY_PATH}: {exc}")
+            return False
+        mutator(memory)
+        _save_unlocked(memory)
+        return True
+
+
+def _save_unlocked(memory: dict) -> None:
+    memory = _trim_to_limit(memory)
+    _atomic_write(
+        MEMORY_PATH,
+        json.dumps(memory, indent=2, ensure_ascii=False),
+    )
 
 def _all_entries(memory: dict) -> list[tuple]:
     entries = []
@@ -116,15 +195,12 @@ def _trim_to_limit(memory: dict) -> dict:
     return memory
 
 def save_memory(memory: dict) -> None:
+    """Replace the fact file. Prefer ``update_raw`` when you are editing the
+    copy you just loaded — two of those in parallel drop a key."""
     if not isinstance(memory, dict):
         return
-    memory = _trim_to_limit(memory)
-    MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _lock:
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        _save_unlocked(memory)
 
 
 def _truncate_value(val: str) -> str:
@@ -147,7 +223,9 @@ def _recursive_update(target: dict, updates: dict) -> bool:
             if _recursive_update(target[key], value):
                 changed = True
         else:
-            new_val  = _truncate_value(str(value["value"] if isinstance(value, dict) else value))
+            raw = str(value["value"] if isinstance(value, dict) else value)
+            raw, _redactions = redact_text(raw)
+            new_val  = _truncate_value(raw)
             entry    = {"value": new_val, "updated": datetime.now().strftime("%Y-%m-%d")}
             existing = target.get(key, {})
             if not isinstance(existing, dict) or existing.get("value") != new_val:
@@ -159,18 +237,85 @@ def _recursive_update(target: dict, updates: dict) -> bool:
 def update_memory(memory_update: dict) -> dict:
     if not isinstance(memory_update, dict) or not memory_update:
         return load_memory()
-    memory = load_memory()
-    if _recursive_update(memory, memory_update):
-        save_memory(memory)
-        print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
-    return memory
+    holder: dict = {}
+
+    def _mut(memory: dict) -> None:
+        if _recursive_update(memory, memory_update):
+            holder["changed"] = True
+            print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
+        holder["memory"] = memory
+
+    if not update_raw(_mut):
+        return load_memory()
+    return holder.get("memory") or load_memory()
 
 def _entry_value(entry) -> str:
     """Accept both the {'value': ..., 'updated': ...} shape and a bare string,
-    because early versions of the store wrote plain strings."""
+    because early versions of the store wrote plain strings.
+
+    Redacted on the way out as well as on the way in, so a fact written
+    before a pattern existed is not pasted into the prompt verbatim. The
+    file itself is rewritten by ``scrub_facts`` on the first successful load.
+    """
     if isinstance(entry, dict):
-        return str(entry.get("value", "") or "").strip()
-    return str(entry or "").strip()
+        raw = str(entry.get("value", "") or "").strip()
+    else:
+        raw = str(entry or "").strip()
+    cleaned, _n = redact_text(raw)
+    return cleaned.strip()
+
+
+def _redact_inplace(memory: dict) -> int:
+    """Rewrite fact values the redactor recognises. Returns spans removed."""
+    removed = 0
+    categories = set(_empty_memory())
+    for cat, items in list(memory.items()):
+        if cat == "sessions" and isinstance(items, list):
+            for entry in items:
+                if isinstance(entry, dict) and isinstance(entry.get("summary"), str):
+                    cleaned, n = redact_text(entry["summary"])
+                    if n:
+                        entry["summary"] = cleaned
+                        removed += n
+            continue
+        if cat not in categories or not isinstance(items, dict):
+            continue
+        for key, entry in list(items.items()):
+            if isinstance(entry, dict) and "value" in entry:
+                cleaned, n = redact_text(str(entry.get("value") or ""))
+                if n:
+                    entry["value"] = _truncate_value(cleaned)
+                    removed += n
+            elif isinstance(entry, str):
+                cleaned, n = redact_text(entry)
+                if n:
+                    items[key] = {
+                        "value": _truncate_value(cleaned),
+                        "updated": datetime.now().strftime("%Y-%m-%d"),
+                    }
+                    removed += n
+    return removed
+
+
+_facts_scrubbed = False
+
+
+def scrub_facts() -> int:
+    """Rewrite ``long_term.json`` once if any stored fact matches the redactor.
+
+    A miss stays a miss. This does not encrypt the file.
+    """
+    global _facts_scrubbed
+    with _lock:
+        try:
+            memory = _load_unlocked()
+        except MemoryReadError:
+            return 0
+        removed = _redact_inplace(memory)
+        if removed:
+            _save_unlocked(memory)
+        _facts_scrubbed = True
+        return removed
 
 
 def _pretty(key: str) -> str:
@@ -347,11 +492,13 @@ def _score(query_words: list[str], cat: str, key: str, value: str) -> int:
     return score
 
 
-def search_memory(query: str, limit: int = 8) -> str:
-    """Find stored facts matching `query`. Backs the recall_memory tool.
+# What recall_memory is allowed to hand back in one turn. Facts and journal
+# share it. The prompt has its own, smaller, budgets in format_memory_for_prompt
+# and store.recent_for_prompt.
+RECALL_CHAR_BUDGET = 1_800
 
-    An empty query is treated as "show me everything you know", capped - the
-    model asks that when the user says "what do you remember about me?"."""
+
+def _search_facts(query: str, limit: int) -> str:
     memory = load_memory()
     words  = [w for w in re.split(r"[^\w]+", (query or "").lower()) if len(w) > 1]
 
@@ -368,8 +515,7 @@ def search_memory(query: str, limit: int = 8) -> str:
                 rows.append((s, cat, key, val))
 
     if not rows:
-        return (f"Nothing stored about '{query}'." if query
-                else "I have not stored anything about this person yet.")
+        return ""
 
     rows.sort(key=lambda r: (-r[0], r[2]))
     lines = [f"{cat}/{_pretty(key)}: {val}" for _s, cat, key, val in rows[:max(1, limit)]]
@@ -378,6 +524,111 @@ def search_memory(query: str, limit: int = 8) -> str:
     more  = (f"\n(+{len(rows) - len(lines)} more — search with a narrower keyword)"
              if len(rows) > len(lines) else "")
     return head + "\n" + "\n".join(lines) + more
+
+
+def _bound(text: str, budget: int) -> str:
+    if len(text) <= budget:
+        return text
+    return text[: budget - 1].rstrip() + "…"
+
+
+def search_memory(query: str, limit: int = 8) -> str:
+    """Facts plus the journal, packed into one bounded reply.
+
+    Backs the recall_memory tool. An empty query lists what is stored, still
+    capped — it is the answer to "what do you remember about me?", not a
+    dump of every turn. The journal is read through its index. A failure
+    there still returns the facts.
+    """
+    facts = _search_facts(query, limit)
+    journal = ""
+    try:
+        from memory import store
+        remaining = RECALL_CHAR_BUDGET - (len(facts) + 2 if facts else 0)
+        if remaining > 80:
+            journal = store.recall(query, limit=limit, char_budget=remaining)
+    except Exception as exc:
+        print(f"[Memory] journal recall failed: {exc}")
+
+    if facts and journal:
+        text = facts + "\n\n" + journal
+    elif facts:
+        text = facts
+    elif journal:
+        text = journal
+    elif query:
+        text = f"Nothing stored about '{query}'."
+    else:
+        text = "I have not stored anything about this person yet."
+    return _bound(text, RECALL_CHAR_BUDGET)
+
+
+def manage_memory(action: str, *, query: str = "", category: str = "",
+                  key: str = "", episode_id=None, value: str = "") -> str:
+    """Review, correct, or delete. Used by the manage_memory tool and the panel.
+
+    Never raises. Deleting a fact does not delete journal lines that mention
+    it, and the reverse is also true — say which one changed.
+    """
+    action = (action or "").strip().lower()
+    try:
+        if action in ("list", "review", "show"):
+            return _manage_list(query)
+        if action in ("correct", "update", "edit"):
+            return _manage_correct(category, key, episode_id, value)
+        if action in ("forget", "delete", "remove"):
+            return _manage_forget(category, key, episode_id)
+        return "Use list, correct, or forget."
+    except Exception as exc:
+        return f"Memory update failed: {exc}"
+
+
+def _manage_list(query: str) -> str:
+    facts = all_entries_for_ui()
+    lines = ["Facts:"]
+    if not facts:
+        lines.append("(none)")
+    for row in facts[:12]:
+        lines.append(f"- {row['category']}/{row['key']} = {row['value']}")
+    if len(facts) > 12:
+        lines.append(f"(+{len(facts) - 12} more facts)")
+    try:
+        from memory import store
+        episodes = store.list_entries(limit=12)
+    except Exception as exc:
+        episodes = []
+        lines.append(f"(journal unavailable: {exc})")
+    lines.append("Journal:")
+    if not episodes:
+        lines.append("(none)")
+    for row in episodes:
+        snippet = (row.get("body") or "").replace("\n", " ")[:80]
+        lines.append(f"- #{row['id']} {row['kind']} {snippet}")
+    text = "\n".join(lines)
+    if query:
+        # A filtered view still has to come from the index, not from a
+        # client-side scan of a list we already truncated.
+        found = search_memory(query, limit=6)
+        text = text + "\n\n" + found
+    return _bound(text, RECALL_CHAR_BUDGET)
+
+
+def _manage_correct(category: str, key: str, episode_id, value: str) -> str:
+    if episode_id not in (None, ""):
+        from memory import store
+        return store.correct(episode_id, value or "")
+    if key:
+        return correct(key, value or "", category or "notes")
+    return "Say which fact (category and key) or which journal id to correct."
+
+
+def _manage_forget(category: str, key: str, episode_id) -> str:
+    if episode_id not in (None, ""):
+        from memory import store
+        return store.forget(episode_id)
+    if key:
+        return forget(key, category or "notes")
+    return "Say which fact (category and key) or which journal id to delete."
 
 
 def all_entries_for_ui() -> list[dict]:
@@ -410,14 +661,51 @@ def remember(key: str, value: str, category: str = "notes") -> str:
 
 
 def forget(key: str, category: str = "notes") -> str:
-    memory = load_memory()
-    cat    = memory.get(category, {})
-    if key in cat:
-        del cat[key]
-        memory[category] = cat
-        save_memory(memory)
+    found = {"yes": False}
+
+    def _mut(memory: dict) -> None:
+        cat = memory.get(category, {})
+        if isinstance(cat, dict) and key in cat:
+            del cat[key]
+            memory[category] = cat
+            found["yes"] = True
+
+    if not update_raw(_mut):
+        return f"Could not update memory — {MEMORY_PATH.name} could not be read."
+    if found["yes"]:
         return f"Forgotten: {category}/{key}"
     return f"Not found: {category}/{key}"
+
+
+def correct(key: str, value: str, category: str = "notes") -> str:
+    """Replace one fact. The new text goes through the same redactor as a save.
+
+    This does not rewrite older journal lines that quoted the old value.
+    Those stay until they are deleted or compacted. The fact itself is what
+    the prompt prefers.
+    """
+    valid = {"identity", "preferences", "projects", "relationships", "wishes", "notes"}
+    if category not in valid:
+        category = "notes"
+    cleaned, _n = redact_text(value or "")
+    cleaned = _truncate_value(cleaned.strip())
+    if not cleaned:
+        return "Nothing to store."
+    found = {"yes": False}
+
+    def _mut(memory: dict) -> None:
+        cat = memory.get(category)
+        if not isinstance(cat, dict) or key not in cat:
+            return
+        cat[key] = {"value": cleaned, "updated": datetime.now().strftime("%Y-%m-%d")}
+        memory[category] = cat
+        found["yes"] = True
+
+    if not update_raw(_mut):
+        return f"Could not update memory — {MEMORY_PATH.name} could not be read."
+    if not found["yes"]:
+        return f"Not found: {category}/{key}"
+    return f"Updated: {category}/{key}"
 
 
 forget_memory = forget
@@ -429,51 +717,52 @@ _SESSION_MAX = 3   # safety cap — in practice 0-1 entries after pop
 
 
 def save_session_summary(summary: str, language: str = "") -> None:
-    """Append a 1-2 sentence session summary to long_term.json['sessions']."""
-    summary = (summary or "").strip()
+    """Append a 1-2 sentence session summary to long_term.json['sessions'].
+
+    The journal keeps its own copy. This list is only the line the next
+    morning briefing speaks once and then pops. It is still capped at
+    ``_SESSION_MAX`` so a crash before the pop cannot grow it without bound.
+    """
+    summary, _n = redact_text((summary or "").strip())
     if not summary:
         return
-    memory   = load_memory()
-    sessions = memory.get("sessions", [])
-    if not isinstance(sessions, list):
-        sessions = []
     entry: dict = {
         "date":    datetime.now().strftime("%Y-%m-%d"),
         "summary": summary[:280],
     }
     if language:
         entry["language"] = language
-    sessions.append(entry)
-    memory["sessions"] = sessions[-_SESSION_MAX:]
-    with _lock:
-        MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MEMORY_PATH.write_text(
-            json.dumps(memory, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    print(f"[Memory] 📝 Session saved ({entry['date']}): {summary[:60]}…")
+
+    def _mut(memory: dict) -> None:
+        sessions = memory.get("sessions", [])
+        if not isinstance(sessions, list):
+            sessions = []
+        sessions.append(entry)
+        memory["sessions"] = sessions[-_SESSION_MAX:]
+
+    if update_raw(_mut):
+        print(f"[Memory] 📝 Session saved ({entry['date']}): {summary[:60]}…")
 
 
 def pop_last_session() -> dict | None:
     """
     Return AND remove the most recent session entry.
     Calling this consumes the entry so it is never repeated in future briefings.
+    The journal copy is not removed — recall can still find it.
     """
-    with _lock:
-        if not MEMORY_PATH.exists():
+    found: dict = {}
+
+    def _mut(memory: dict) -> None:
+        sessions = memory.get("sessions", [])
+        if not isinstance(sessions, list) or not sessions:
+            return
+        found["entry"] = sessions.pop()
+        memory["sessions"] = sessions
+
+    try:
+        if not update_raw(_mut):
             return None
-        try:
-            memory   = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
-            sessions = memory.get("sessions", [])
-            if not isinstance(sessions, list) or not sessions:
-                return None
-            entry = sessions.pop()          # remove the last entry
-            memory["sessions"] = sessions
-            MEMORY_PATH.write_text(
-                json.dumps(memory, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            return entry
-        except Exception as e:
-            print(f"[Memory] ⚠️ pop_last_session error: {e}")
-            return None
+    except Exception as exc:
+        print(f"[Memory] ⚠️ pop_last_session error: {exc}")
+        return None
+    return found.get("entry")

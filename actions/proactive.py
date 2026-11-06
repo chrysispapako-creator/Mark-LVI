@@ -97,11 +97,21 @@ class ProactiveEngine:
                 "You may mention one if it seems relevant."
             )
 
-        # Optional: recent conversation context
+        # Optional: recent conversation context. The live log wins while the
+        # session is up. After a reconnect that log is empty, and the journal
+        # still has a bounded slice — the same one the system prompt uses.
         recent_ctx = ""
         if recent_turns:
             snippet = "\n".join(recent_turns[-6:])
             recent_ctx = f"\nRecent conversation:\n{snippet}"
+        else:
+            try:
+                from memory.store import recent_for_prompt
+                remembered = recent_for_prompt(400)
+                if remembered:
+                    recent_ctx = "\n" + remembered
+            except Exception:
+                recent_ctx = ""
 
         return "\n".join([
             "[PROACTIVE_CHECK] You are initiating a proactive check-in.",

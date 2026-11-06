@@ -41,6 +41,7 @@ import time
 import json
 import sys
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -282,8 +283,10 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
         "you cannot take, and never report a result you did not get.",
         "- You act on this machine only. You cannot reach the user's other "
         "devices, accounts or hardware except through the tools listed above.",
-        "- You remember what is in the memory block and what has been said this "
-        "session. Anything else you were told before is gone unless it was saved.",
+        "- You remember the memory block plus a local journal of conversations, "
+        "tasks, decisions, actions and results. The block is only what fits. "
+        "Call recall_memory for anything older or not shown. A provider's own "
+        "context is not kept after the session ends unless it was saved here.",
     ]
     # What the PLATFORM forbids, before what the build lacks.
     #
@@ -507,6 +510,49 @@ TOOL_DECLARATIONS = [
         },
     },
     {
+        "name": "manage_memory",
+        "description": (
+            "Review, correct, or delete something stored in local memory. "
+            "Use when the user asks what you remember (action 'list'), says a "
+            "memory is wrong (action 'correct'), or tells you to forget it "
+            "(action 'forget'). "
+            "A fact is addressed by category + key. A journal entry — a past "
+            "conversation line, a task, a decision, an action or a result — "
+            "is addressed by the id from action 'list'. "
+            "This only changes local memory. It does not search the web."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "list | correct | forget",
+                },
+                "query": {
+                    "type": "STRING",
+                    "description": "Optional keyword when listing.",
+                },
+                "category": {
+                    "type": "STRING",
+                    "description": "Fact category: identity, preferences, projects, relationships, wishes, notes.",
+                },
+                "key": {
+                    "type": "STRING",
+                    "description": "Fact key, such as favorite_food.",
+                },
+                "id": {
+                    "type": "STRING",
+                    "description": "Journal entry id from a previous list.",
+                },
+                "value": {
+                    "type": "STRING",
+                    "description": "Replacement text when correcting.",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "undo",
         "description": (
             "Reverse the last change YOU made to this computer — a file you "
@@ -657,6 +703,15 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        # One id for this process. Rows written by the voice loop, the
+        # dashboard, typed commands and tools all land in the same journal
+        # under this id, so a later session can recall them without loading
+        # the file into the prompt.
+        self._memory_session = (
+            datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+        )
+        from memory.session import SharedMemory
+        self._shared_memory = SharedMemory(self._memory_session)
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
         self._tuned_live    = True  # turn-taking / media / thinking knobs; same fallback
@@ -972,6 +1027,7 @@ class JarvisLive:
         if self._wake_enabled and not self._awake:
             self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
             return
+        self._remember_turn("user", text, "typed")
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
@@ -1131,6 +1187,16 @@ class JarvisLive:
 
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
+        # The fact block is bounded on its own. This adds a second, separate
+        # budget: the last few journal lines, not the table. recall_memory
+        # is how anything older gets in.
+        try:
+            from memory.store import recent_for_prompt
+            _recent = recent_for_prompt()
+            if _recent:
+                mem_str = (mem_str.rstrip() + "\n\n" + _recent + "\n") if mem_str else (_recent + "\n")
+        except Exception as _mem_exc:
+            print(f"[Memory] recent context unavailable: {_mem_exc}")
         sys_prompt = _load_system_prompt()
 
         now      = datetime.now()
@@ -1329,7 +1395,12 @@ class JarvisLive:
             key      = args.get("key", "")
             value    = args.get("value", "")
             if key and value:
+                from memory.redact import redact_text
+                value, _n = redact_text(str(value))
                 update_memory({category: {key: {"value": value}}})
+                # A decision row so recall finds it even when the fact did not
+                # fit in the prompt. The value here is already redacted.
+                self._remember_decision(f"Saved {category}/{key} = {value}")
                 print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
@@ -1343,11 +1414,21 @@ class JarvisLive:
 
         try:
             if name == "recall_memory":
-                # Local file search: no network, no second model. Kept out of
-                # the executor deliberately — it is a dictionary scan over a few
-                # hundred short strings, and a thread hop would cost more than
-                # the work itself.
+                # Local search: facts plus the journal index. No network, no
+                # second model. Kept out of the executor deliberately — a
+                # thread hop would cost more than the lookup.
                 result = search_memory(args.get("query", ""), limit=8)
+
+            elif name == "manage_memory":
+                from memory.memory_manager import manage_memory
+                result = manage_memory(
+                    args.get("action", ""),
+                    query=str(args.get("query", "") or ""),
+                    category=str(args.get("category", "") or ""),
+                    key=str(args.get("key", "") or ""),
+                    episode_id=args.get("id", None),
+                    value=str(args.get("value", "") or ""),
+                )
 
             elif name == "undo":
                 if str(args.get("action", "")).lower().strip() == "list":
@@ -1452,7 +1533,7 @@ class JarvisLive:
                     args["folder"] = self.ui.current_file
                     args["mode"] = "improve"
                 _ctx = {"player": self.ui, "speak": self.speak,
-                        "response": None, "session_memory": None}
+                        "response": None, "session_memory": self._shared_memory}
                 r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
                 result = r or "Done."
                 # web_search: mirror results to the on-screen content panel
@@ -1471,7 +1552,8 @@ class JarvisLive:
                 if self._plugin_registry.has(name):
                     r = await loop.run_in_executor(
                         None,
-                        lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
+                        lambda: self._plugin_registry.run(
+                            name, args, player=self.ui, session_memory=self._shared_memory)
                     )
                     result = r or "Done."
                 else:
@@ -1490,6 +1572,7 @@ class JarvisLive:
         # without it the two look identical from the outside.
         print(f"[JARVIS] 📤 {name} ({(time.monotonic() - _t_tool) * 1000:.0f} ms) "
               f"→ {str(result)[:80]}")
+        self._remember_tool(name, args, result)
 
         # A tool that declared itself NON_BLOCKING also says when its answer may
         # re-enter the conversation. Without this the model finishes whatever it
@@ -1767,6 +1850,7 @@ class JarvisLive:
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
+                                self._remember_turn("user", full_in, "voice")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",
@@ -1786,6 +1870,7 @@ class JarvisLive:
                                 self._last_out_logged = full_out
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
+                                self._remember_turn("assistant", full_out, "voice")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",
@@ -2091,31 +2176,63 @@ class JarvisLive:
 
     # ── Session memory ──────────────────────────────────────────────────────────
 
+    def _remember_turn(self, role: str, text: str, source: str) -> None:
+        """Journal one line. Failure here must never break the turn."""
+        try:
+            from memory.store import record_turn
+            record_turn(role, text, self._memory_session, source)
+        except Exception as exc:
+            print(f"[Memory] turn not stored: {exc}")
+
+    def _remember_decision(self, text: str) -> None:
+        try:
+            from memory.store import record
+            record(
+                "decision", text, role="assistant", source="save_memory",
+                session_id=self._memory_session, importance=1,
+            )
+        except Exception as exc:
+            print(f"[Memory] decision not stored: {exc}")
+
+    def _remember_tool(self, name: str, args: dict, result: str) -> None:
+        try:
+            from memory.store import record_tool
+            record_tool(name, args, result, self._memory_session)
+        except Exception as exc:
+            print(f"[Memory] tool result not stored: {exc}")
+
     async def _save_session_summary(self) -> None:
-        """Summarise the current session in 1-2 sentences and save to long_term.json."""
-        log = self._session_log
+        """Fold this session into a short local summary. No model call.
+
+        The turns are already in the journal. This writes one extractive
+        summary — used by the next morning briefing — and compacts the
+        journal if it has grown past its storage budget. A provider is
+        never asked to summarise, so a session with no API key still leaves
+        a memory behind.
+        """
+        log = list(self._session_log)
         if len(log) < 3:          # need at least one exchange to be worth saving
             return
         self._session_log = []    # reset immediately so the next session starts clean
 
-        memory = load_memory()
-        lang_entry = memory.get("identity", {}).get("language", {})
-        lang = (lang_entry.get("value", "") if isinstance(lang_entry, dict) else str(lang_entry)).strip()
-        lang = lang or "English"
-
-        convo = "\n".join(log[-40:])   # cap at last 40 turns to stay within token budget
-        prompt = (
-            f"Summarize this conversation in 1-2 sentences in {lang}. "
-            "Focus on what the user accomplished or discussed. "
-            "Output ONLY the summary text, nothing else:\n\n" + convo
-        )
-        try:
-            from core import gemini
-            summary = await asyncio.to_thread(
-                gemini.text, prompt, gemini.SMART, None, 30_000,
-            )
+        def _work() -> str:
+            from memory.store import session_summary, record
+            summary = session_summary(self._memory_session)
+            if not summary:
+                # The journal missed the turns (disk error mid-session). Keep
+                # the in-memory log's own words rather than dropping the session.
+                summary = " ".join(log[-6:])[:280].strip()
+                if summary:
+                    record(
+                        "summary", summary, source="session",
+                        session_id=self._memory_session, title="Session",
+                    )
             if summary:
-                save_session_summary(summary, lang)
+                save_session_summary(summary, "")
+            return summary
+
+        try:
+            await asyncio.to_thread(_work)
         except Exception as e:
             print(f"[Memory] ⚠️ Session summary failed: {e}")
 
@@ -2159,6 +2276,15 @@ class JarvisLive:
                         lang_e = memory.get("identity", {}).get("language", {})
                         lang   = (lang_e.get("value", "") if isinstance(lang_e, dict) else str(lang_e)).strip() or "English"
                         for alert in alerts:
+                            try:
+                                from memory.store import record
+                                record(
+                                    "result", alert, role="assistant",
+                                    source="monitor", title="monitor",
+                                    session_id=self._memory_session,
+                                )
+                            except Exception as _mem_exc:
+                                print(f"[Memory] monitor alert not stored: {_mem_exc}")
                             msg = (
                                 f"{alert}\n\n"
                                 f"Inform the user about this development naturally in {lang}. "
@@ -2265,6 +2391,7 @@ class JarvisLive:
                         turn_complete=True,
                     )
                     self.ui.write_log(f"[Web]: {text}")
+                    self._remember_turn("user", text, "dashboard")
                 else:
                     print(f"[Dashboard] Dropped command (no session): {text}")
             except asyncio.TimeoutError:

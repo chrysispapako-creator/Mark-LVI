@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import math
 import os
@@ -50,7 +51,8 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
     print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
 
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
+    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QMenu,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QGraphicsScene, QGraphicsView,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar, QSlider,
@@ -2463,7 +2465,7 @@ class MemoryOverlay(_HudOverlay):
     the other half of that change — a memory you cannot inspect is a memory you
     cannot trust, and 'delete' has to be something the person can do."""
 
-    _OW = 520
+    _OW = 560
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2480,6 +2482,7 @@ class MemoryOverlay(_HudOverlay):
         self._lay = QVBoxLayout(self)
         self._lay.setContentsMargins(20, 16, 20, 16)
         self._lay.setSpacing(5)
+        self._query = ""
         self._rebuild()
 
     def _clear_layout(self):
@@ -2561,15 +2564,56 @@ class MemoryOverlay(_HudOverlay):
 
         rows = all_entries_for_ui()
 
-        cap = QLabel(f"{len(rows)} stored facts — newest first. "
-                     f"Nothing here is sent anywhere; it lives in "
-                     f"memory/long_term.json on this machine.")
+        journal, journal_note = self._journal_rows()
+        # A typed query goes through the journal index, so a hit older than
+        # the forty rows on screen is still found. It does not load the table.
+        if self._query:
+            try:
+                from memory.store import search_entries
+                shown = search_entries(self._query, limit=40)
+            except Exception:
+                shown = []
+        else:
+            shown = journal
+
+        cap = QLabel(
+            f"{len(rows)} facts in memory/long_term.json. "
+            f"{journal_note} "
+            "Both stay on this machine. Secret-shaped text is redacted before "
+            "it is stored — that filter misses secrets that do not look like "
+            "keys, and it is not encryption."
+        )
         cap.setWordWrap(True)
         cap.setFont(QFont("Courier New", 7))
         cap.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         self._lay.addWidget(cap)
 
-        if not rows:
+        find_row = QHBoxLayout(); find_row.setSpacing(6)
+        find = QLineEdit(self._query)
+        find.setPlaceholderText("Find in the journal")
+        find.setFont(QFont("Courier New", 8))
+        find.setStyleSheet(
+            f"QLineEdit {{ background: {C.DARK}; color: {C.TEXT}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 6px; }}"
+        )
+        find_row.addWidget(find, 1)
+        go = QPushButton("FIND")
+        go.setFixedHeight(22)
+        go.setFont(QFont("Courier New", 7))
+        go.setCursor(Qt.CursorShape.PointingHandCursor)
+        go.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        go.clicked.connect(lambda _=False, box=find: self._set_query(box.text()))
+        find.returnPressed.connect(lambda box=find: self._set_query(box.text()))
+        find_row.addWidget(go)
+        find_host = QWidget()
+        find_host.setLayout(find_row)
+        self._lay.addWidget(find_host)
+
+        if not rows and not shown:
             empty = QLabel("Nothing stored yet.")
             empty.setFont(QFont("Courier New", 9))
             empty.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
@@ -2577,7 +2621,7 @@ class MemoryOverlay(_HudOverlay):
         else:
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
-            scroll.setFixedHeight(min(420, 34 * len(rows) + 10))
+            scroll.setFixedHeight(min(460, 28 * (len(rows) + len(shown) + 2) + 24))
             scroll.setStyleSheet(
                 f"QScrollArea {{ border: 1px solid {C.BORDER}; border-radius: 3px; "
                 f"background: transparent; }}"
@@ -2587,37 +2631,14 @@ class MemoryOverlay(_HudOverlay):
             ilay.setContentsMargins(6, 6, 6, 6)
             ilay.setSpacing(3)
 
+            if rows:
+                ilay.addWidget(self._memory_heading("FACTS"))
             for r in rows:
-                line = QHBoxLayout(); line.setSpacing(6)
-                txt = QLabel(f"<b>{r['key'].replace('_', ' ')}</b> "
-                             f"<span style='color:{C.TEXT_MED}'>— {r['value']}</span>")
-                txt.setWordWrap(True)
-                txt.setFont(QFont("Courier New", 8))
-                txt.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
-                line.addWidget(txt, 1)
-
-                meta = QLabel(f"{r['category'][:4]} · {r['updated'] or '—'}")
-                meta.setFont(QFont("Courier New", 7))
-                meta.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
-                line.addWidget(meta)
-
-                rm = QPushButton("✕")
-                rm.setFixedSize(20, 20)
-                rm.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-                rm.setCursor(Qt.CursorShape.PointingHandCursor)
-                rm.setToolTip("Forget this")
-                rm.setStyleSheet(f"""
-                    QPushButton {{ background: transparent; color: {C.TEXT_DIM};
-                        border: 1px solid {C.BORDER}; border-radius: 3px; }}
-                    QPushButton:hover {{ color: {C.RED}; border-color: {C.RED}; }}
-                """)
-                rm.clicked.connect(
-                    lambda _=False, c=r["category"], k=r["key"]: self._forget(c, k))
-                line.addWidget(rm)
-
-                holder = QWidget()
-                holder.setLayout(line)
-                ilay.addWidget(holder)
+                ilay.addWidget(self._fact_row(r))
+            if shown:
+                ilay.addWidget(self._memory_heading("JOURNAL — conversations, actions, results"))
+            for entry in shown[:40]:
+                ilay.addWidget(self._episode_row(entry))
 
             ilay.addStretch()
             scroll.setWidget(inner)
@@ -2641,6 +2662,107 @@ class MemoryOverlay(_HudOverlay):
         # got it right: _settle is idempotent.
         QTimer.singleShot(0, lambda g=before: self._settle(g))
 
+    def _memory_heading(self, text: str) -> QLabel:
+        lab = QLabel(text)
+        lab.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        lab.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
+        return lab
+
+    def _tiny_button(self, label: str, tip: str) -> QPushButton:
+        btn = QPushButton(label)
+        btn.setFixedSize(20, 20)
+        btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setToolTip(tip)
+        btn.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_DIM};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.RED}; border-color: {C.RED}; }}
+        """)
+        return btn
+
+    def _fact_row(self, r: dict) -> QWidget:
+        line = QHBoxLayout(); line.setSpacing(6)
+        key = html.escape(r["key"].replace("_", " "))
+        val = html.escape(r["value"])
+        txt = QLabel(f"<b>{key}</b> "
+                     f"<span style='color:{C.TEXT_MED}'>— {val}</span>")
+        txt.setWordWrap(True)
+        txt.setFont(QFont("Courier New", 8))
+        txt.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        line.addWidget(txt, 1)
+
+        meta = QLabel(f"{r['category'][:4]} · {r['updated'] or '—'}")
+        meta.setFont(QFont("Courier New", 7))
+        meta.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        line.addWidget(meta)
+
+        edit = self._tiny_button("✎", "Correct this")
+        edit.clicked.connect(
+            lambda _=False, c=r["category"], k=r["key"], v=r["value"]: self._edit_fact(c, k, v))
+        line.addWidget(edit)
+
+        rm = self._tiny_button("✕", "Forget this")
+        rm.clicked.connect(
+            lambda _=False, c=r["category"], k=r["key"]: self._forget(c, k))
+        line.addWidget(rm)
+
+        holder = QWidget()
+        holder.setLayout(line)
+        return holder
+
+    def _episode_row(self, entry: dict) -> QWidget:
+        line = QHBoxLayout(); line.setSpacing(6)
+        body = (entry.get("body") or "").replace("\n", " ")
+        snippet = html.escape(body[:110])
+        kind = html.escape(str(entry.get("kind") or ""))
+        txt = QLabel(f"<b>#{entry['id']} {kind}</b> "
+                     f"<span style='color:{C.TEXT_MED}'>— {snippet}</span>")
+        txt.setWordWrap(True)
+        txt.setFont(QFont("Courier New", 8))
+        txt.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        line.addWidget(txt, 1)
+
+        flag = "redacted" if entry.get("redactions") else (entry.get("created") or "")[:16]
+        meta = QLabel(flag)
+        meta.setFont(QFont("Courier New", 7))
+        meta.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        line.addWidget(meta)
+
+        edit = self._tiny_button("✎", "Correct this entry")
+        edit.clicked.connect(
+            lambda _=False, i=entry["id"], b=entry.get("body") or "": self._edit_episode(i, b))
+        line.addWidget(edit)
+
+        rm = self._tiny_button("✕", "Delete this entry")
+        rm.clicked.connect(lambda _=False, i=entry["id"]: self._forget_episode(i))
+        line.addWidget(rm)
+
+        holder = QWidget()
+        holder.setLayout(line)
+        return holder
+
+    def _journal_rows(self) -> tuple[list, str]:
+        try:
+            from memory.store import list_entries, stats
+            rows = list_entries(limit=40)
+            info = stats()
+            note = (
+                f"{info.get('active', len(rows))} journal rows in "
+                f"memory/journal.sqlite"
+                + (f", {info.get('compacted', 0)} folded."
+                   if info.get("compacted") else ".")
+            )
+            if not info.get("fts", True):
+                note += " Keyword index unavailable — recall only scans recent rows."
+            return rows, note
+        except Exception as exc:
+            return [], f"Journal unavailable ({exc})."
+
+    def _set_query(self, text: str) -> None:
+        self._query = (text or "").strip()
+        QTimer.singleShot(0, self._rebuild)
+
     def _forget(self, category: str, key: str):
         from memory.memory_manager import forget
         forget(key, category)
@@ -2648,6 +2770,29 @@ class MemoryOverlay(_HudOverlay):
         # The rebuild destroys the very ✕ button that emitted this signal, and
         # Qt is entitled to touch the sender after a slot returns; tearing it
         # down mid-emission is how a widget ends up half-alive on screen.
+        QTimer.singleShot(0, self._rebuild)
+
+    def _edit_fact(self, category: str, key: str, value: str):
+        text, ok = QInputDialog.getText(
+            self, "Correct memory", f"{category}/{key}", text=value)
+        if not ok:
+            return
+        from memory.memory_manager import correct
+        correct(key, text, category)
+        QTimer.singleShot(0, self._rebuild)
+
+    def _edit_episode(self, episode_id: int, body: str):
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Correct memory", f"Entry #{episode_id}", body)
+        if not ok:
+            return
+        from memory.store import correct
+        correct(episode_id, text)
+        QTimer.singleShot(0, self._rebuild)
+
+    def _forget_episode(self, episode_id: int):
+        from memory.store import forget
+        forget(episode_id)
         QTimer.singleShot(0, self._rebuild)
 
 
